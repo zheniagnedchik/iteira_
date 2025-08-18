@@ -67,24 +67,7 @@ class TelegramBot:
             user_name=user.first_name
         )
         
-        # Добавляем кнопки быстрых действий в стиле Итейра
-        keyboard = [
-            [
-                InlineKeyboardButton("💆‍♀️ Массаж и уход за лицом", callback_data="quick_массаж лица"),
-                InlineKeyboardButton("✨ Чистка и пилинги", callback_data="quick_чистка кожи")
-            ],
-            [
-                InlineKeyboardButton("💉 Инъекционная косметология", callback_data="quick_инъекции красоты"),
-                InlineKeyboardButton("🌟 Аппаратная косметология", callback_data="quick_аппаратные процедуры")
-            ],
-            [
-                InlineKeyboardButton("� ЗПосмотреть все услуги", callback_data="quick_все услуги"),
-                InlineKeyboardButton("📞 Записаться на консультацию", callback_data="quick_консультация")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(response, reply_markup=reply_markup)
+        await update.message.reply_text(response)
     
     @log_operation("telegram_help_command")
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):

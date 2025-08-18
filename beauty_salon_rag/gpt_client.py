@@ -366,6 +366,44 @@ class GPTClient:
                 }
             )
     
+    @log_operation("format_service_list")
+    def format_service_list(self, services: List[Dict[str, Any]], user_context: Dict[str, Any]) -> str:
+        """
+        Форматирует список услуг через GPT для красивого отображения.
+        
+        Args:
+            services: Список услуг с полными данными
+            user_context: Контекст пользователя (имя, история посещений)
+            
+        Returns:
+            Красиво отформатированный список услуг
+        """
+        try:
+            # Подготавливаем данные для GPT
+            services_data = json.dumps(services, ensure_ascii=False, indent=2)
+            user_name = user_context.get('user_name', '')
+            visit_history = user_context.get('visit_history', '')
+            
+            messages = [
+                {
+                    "role": "system",
+                    "content": self._get_service_formatting_prompt()
+                },
+                {
+                    "role": "user", 
+                    "content": f"Пользователь: {user_name}\nИстория посещений: {visit_history}\n\nУслуги для форматирования:\n{services_data}"
+                }
+            ]
+            
+            response = self._make_request(messages, temperature=0.3)
+            self.logger.info(f"Formatted service list for user: {user_name}")
+            return response
+            
+        except Exception as e:
+            self.logger.error(f"Service list formatting failed: {e}")
+            # Возвращаем базовое форматирование в случае ошибки
+            return self._fallback_service_formatting(services, user_context)
+    
     def _get_search_system_prompt(self) -> str:
         """Get system prompt for search GPT"""
         return """Ты - система поиска услуг салона красоты. Твоя задача - найти наиболее релевантные услуги по запросу пользователя.
@@ -432,42 +470,56 @@ class GPTClient:
 ДОСТУПНЫЕ ДЕЙСТВИЯ:
 1. "greeting" - приветствие нового пользователя
 2. "collect_name" - сбор имени пользователя
-3. "show_service_list" - показать список доступных услуг для записи
-4. "confirm_service_selection" - подтвердить выбор услуги по номеру
-5. "show_available_dates" - показать доступные даты для записи
-6. "show_masters" - показать информацию о мастерах для выбранной услуги
-7. "confirm_date_selection" - подтвердить выбор даты
-8. "show_booking_summary" - показать итоговую информацию о записи
-9. "service_consultation" - предоставить консультацию об услугах
-10. "handle_gratitude" - обработать благодарность
-11. "general_chat" - общий чат
+3. "ask_visit_history" - узнать о предыдущих посещениях
+4. "show_service_list" - показать список доступных услуг для записи
+5. "confirm_service_selection" - подтвердить выбор услуги по номеру
+6. "show_available_dates" - показать доступные даты для записи
+7. "show_masters" - показать информацию о мастерах для выбранной услуги
+8. "confirm_date_selection" - подтвердить выбор даты
+9. "show_booking_summary" - показать итоговую информацию о записи
+10. "service_consultation" - предоставить консультацию об услугах
+11. "handle_gratitude" - обработать благодарность
+12. "general_chat" - общий чат
 
 КОНТЕКСТ ДИАЛОГА включает:
 - user_name: имя пользователя (если известно)
+- visit_history: информация о предыдущих посещениях (new_client/returning_client/null)
 - conversation_history: история сообщений
-- current_state: текущее состояние диалога
+- current_state: текущее состояние диалога (initial/collecting_name/collecting_history/ready_for_service)
 - selected_services: выбранные услуги (если есть)
 - available_services: доступные услуги (если есть)
 
-ЛОГИКА ПРИНЯТИЯ РЕШЕНИЙ:
+ВАЖНО: ВСЕГДА проверяй current_state перед принятием решения!
+
+ЛОГИКА ПРИНЯТИЯ РЕШЕНИЙ (СТРОГО ПО ПОРЯДКУ):
 
 1. Если пользователь впервые пишет или приветствует - action: "greeting"
 
-2. Если пользователь не представился и пишет имя - action: "collect_name"
+2. Если current_state = "collecting_name" и пользователь пишет имя - action: "collect_name", parameters: {"name": "имя_пользователя"}
 
-3. Если пользователь хочет записаться на услугу ("хочу маникюр", "записаться на массаж", "нужен пилинг") - action: "show_service_list", parameters: {"service_type": "маникюр/массаж/пилинг"}
+3. Если пользователь представился (есть user_name), но visit_history = null - ОБЯЗАТЕЛЬНО action: "ask_visit_history" (спросить о предыдущих посещениях)
 
-4. Если пользователь выбирает услугу по номеру ("1", "2", "номер 3") и есть список услуг - action: "confirm_service_selection", parameters: {"service_number": 1}
+4. Если current_state = "collecting_history" и пользователь отвечает на вопрос о посещениях ("была", "был", "нет", "первый раз") - action: "ask_visit_history"
 
-5. Если пользователь хочет посмотреть даты ("даты", "доступные даты") - action: "show_available_dates"
+КРИТИЧЕСКИ ВАЖНО: 
+- ВСЕГДА проверяй visit_history! Если он null - спрашивай о посещениях!
+- НЕ делай предположений о том, постоянный клиент или новый
+- НЕ переходи к услугам без сбора visit_history!
+- Если пользователь ОПИСЫВАЕТ ПРОБЛЕМУ ("выпадают волосы", "морщины", "прыщи") - это ВСЕГДА запрос на услуги!
 
-6. Если пользователь указывает конкретную дату ("25.08.2025", "завтра") - action: "confirm_date_selection", parameters: {"date": "25.08.2025"}
+5. Если current_state = "ready_for_service" ИЛИ пользователь хочет записаться на услугу или ОПИСЫВАЕТ ПРОБЛЕМУ ("хочу маникюр", "записаться на массаж", "нужен пилинг", "от выпадения волос", "выпадают волосы", "проблемы с кожей", "морщины", "акне", "что делать с...") - action: "show_service_list", parameters: {"service_type": "маникюр/массаж/пилинг/волосы/кожа"}
 
-7. Если пользователь спрашивает об услугах без намерения записаться - action: "service_consultation"
+6. Если пользователь выбирает услугу по номеру ("1", "2", "номер 3") и есть список услуг - action: "confirm_service_selection", parameters: {"service_number": 1}
 
-8. Если пользователь благодарит - action: "handle_gratitude"
+7. Если пользователь хочет посмотреть даты ("даты", "доступные даты") - action: "show_available_dates"
 
-9. В остальных случаях - action: "general_chat"
+8. Если пользователь указывает конкретную дату ("25.08.2025", "завтра") - action: "confirm_date_selection", parameters: {"date": "25.08.2025"}
+
+9. Если пользователь спрашивает об услугах без намерения записаться - action: "service_consultation"
+
+10. Если пользователь благодарит - action: "handle_gratitude"
+
+11. В остальных случаях - action: "general_chat"
 
 ФОРМАТ ОТВЕТА (строго JSON):
 {
@@ -679,3 +731,85 @@ class GPTClient:
                 "min_request_interval": self._min_request_interval
             }
         }
+    
+    def _get_service_formatting_prompt(self) -> str:
+        """Промпт для красивого форматирования списка услуг."""
+        return """Ты - эксперт по презентации услуг салона красоты премиум-класса ITEIRA. 
+
+Твоя задача - создать красивый и привлекательный список услуг на основе предоставленных данных.
+
+ПРИНЦИПЫ ФОРМАТИРОВАНИЯ:
+1. Используй ТОЛЬКО информацию из предоставленных данных - НЕ придумывай ничего нового
+2. Делай технические описания более привлекательными и понятными
+3. Добавляй подходящие эмодзи для визуального улучшения
+4. Группируй услуги по категориям, если их несколько
+5. Адаптируй вступительную фразу в зависимости от истории посещений
+
+СТРУКТУРА ОТВЕТА:
+- Персонализированное обращение с именем: "Спасибо за выбор, {имя}! Доступные услуги для записи:"
+- Группировка по категориям (если нужно)
+- Для каждой услуги:
+  * ОБЯЗАТЕЛЬНО номер и название (например: "1. **Маникюр классический**")
+  * Красивое описание с эмодзи (📋)
+  * Показания с эмодзи (🎯)
+  * Цена в РУБЛЯХ, время, место (💰 X руб. | ⏱ X ч | 📍 место)
+- Инструкция: "Напишите номер услуги (например, 1), чтобы выбрать её для записи."
+
+ПРИМЕРЫ УЛУЧШЕНИЯ ОПИСАНИЙ:
+- "подпиливание" → "деликатное подпиливание"
+- "обработка" → "профессиональная обработка"
+- "полировка" → "бережная полировка"
+- "удаление" → "безболезненное удаление"
+- "коррекция" → "точная коррекция"
+
+ЭМОДЗИ ДЛЯ ПРОБЛЕМ:
+- отросшие ногти → 💅
+- ломкие ногти → 💪
+- морщины → 🦋
+- пигментация → ✨
+- акне → 🌸
+- тусклость → ✨
+
+ПЕРСОНАЛИЗАЦИЯ:
+- ВСЕГДА используй формат: "Спасибо за выбор, {имя пользователя}! Доступные услуги для записи:"
+- Если имя неизвестно, используй: "Спасибо за выбор! Доступные услуги для записи:"
+
+ВАЖНО:
+- Цены ВСЕГДА указывай в РУБЛЯХ (руб.), НЕ используй USD, у.е. или другие валюты
+- Номера услуг ОБЯЗАТЕЛЬНЫ для выбора (1, 2, 3...)
+- Используй ТОЛЬКО данные из предоставленного JSON
+- НЕ добавляй информацию, которой нет в данных
+
+ФОРМАТ ОТВЕТА - только текст списка, без дополнительных комментариев."""
+    
+    def _fallback_service_formatting(self, services: List[Dict[str, Any]], user_context: Dict[str, Any]) -> str:
+        """Базовое форматирование списка услуг в случае ошибки GPT."""
+        user_name = user_context.get('user_name', '')
+        greeting = f"{user_name}, " if user_name else ""
+        
+        response = f"{greeting}отлично! Я нашла доступные услуги для записи:\n\n"
+        
+        for i, service in enumerate(services, 1):
+            title = service.get('title', 'Услуга')
+            price = service.get('price', 0)
+            duration_seconds = service.get('duration', 0)
+            
+            # Форматируем длительность
+            if duration_seconds >= 3600:
+                hours = duration_seconds // 3600
+                minutes = (duration_seconds % 3600) // 60
+                if minutes > 0:
+                    duration = f"{hours} ч {minutes} мин"
+                else:
+                    duration = f"{hours} ч"
+            elif duration_seconds >= 60:
+                minutes = duration_seconds // 60
+                duration = f"{minutes} мин"
+            else:
+                duration = f"{duration_seconds} сек"
+            
+            response += f"{i}. {title}\n"
+            response += f"   💰 {price} руб. | ⏱ {duration}\n\n"
+        
+        response += "Напишите номер услуги (например, 1), чтобы выбрать её для записи."
+        return response

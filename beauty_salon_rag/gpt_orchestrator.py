@@ -82,6 +82,7 @@ class GPTOrchestrator:
             self.user_contexts[user_id] = {
                 'user_id': user_id,
                 'user_name': None,
+                'visit_history': None,
                 'current_state': 'initial',
                 'dialog_history': [],
                 'selected_services': [],
@@ -128,6 +129,9 @@ class GPTOrchestrator:
             elif action.action_type == 'collect_name':
                 return self._handle_name_collection(action, context)
             
+            elif action.action_type == 'ask_visit_history':
+                return self._handle_visit_history(action, context)
+            
             elif action.action_type == 'show_services' or action.action_type == 'show_service_list':
                 return self._handle_show_services(action, context)
             
@@ -169,7 +173,9 @@ class GPTOrchestrator:
             "Я — Ваш персональный виртуальный помощник.\n\n"
             "С удовольствием помогу Вам с выбором процедуры, уточнением стоимости или записью на удобное время.\n\n"
             "Как к Вам обращаться?"
+
         )
+        context['current_state'] = 'collecting_name'
         return response, {"type": "greeting"}
     
     def _handle_name_collection(self, action: DialogAction, context: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -177,10 +183,34 @@ class GPTOrchestrator:
         name = action.parameters.get('name')
         if name:
             context['user_name'] = name
-            response = f"Приятно познакомиться, {name}!\n\nТеперь я смогу обращаться к Вам по имени.\n\nРасскажите, какая процедура Вас интересует?"
+            context['current_state'] = 'collecting_history'
+            response = f"Приятно познакомиться, {name}! 😊\n\nВы уже были у нас в салоне или это будет первое посещение?"
             return response, {"type": "name_collected", "name": name}
         else:
             return action.response_text, {"type": "name_collection"}
+    
+    def _handle_visit_history(self, action: DialogAction, context: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """Обрабатывает сбор информации о предыдущих посещениях."""
+        user_name = context.get('user_name', '')
+        message = action.response_text.lower()
+        
+        if any(word in message for word in ['была', 'был', 'посещал', 'посещала', 'раньше', 'да']):
+            context['visit_history'] = 'returning_client'
+            context['current_state'] = 'ready_for_service'
+            response = f"Отлично! Тогда мы постараемся сделать ваше посещение еще лучше, чем в прошлый раз.\n\n"
+            response += f"Чем вас порадовать сегодня? Возможно:\n"
+            response += f"🔹 Премиальное окрашивание\n"
+            response += f"🔹 Авторская стрижка\n"
+            response += f"🔹 Комплексный уход\n"
+            response += f"🔹 Или что-то другое?"
+        else:
+            context['visit_history'] = 'new_client'
+            context['current_state'] = 'ready_for_service'
+            response = f"Добро пожаловать в ITEIRA! 🌟\n\n"
+            response += f"Мы рады, что вы выбрали наш салон для первого посещения.\n"
+            response += f"Расскажите, какая процедура вас интересует?"
+        
+        return response, {"type": "visit_history_collected"}
     
     def _handle_show_services(self, action: DialogAction, context: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         """Показывает список доступных услуг."""
@@ -211,21 +241,25 @@ class GPTOrchestrator:
         # Сохраняем услуги в контекст
         context['available_services'] = available_services
         
-        # Генерируем красивый список
-        user_name = context.get('user_name', '')
-        greeting = f"{user_name}, " if user_name else ""
-        
-        response = f"{greeting}отлично! Я нашла доступные услуги для записи:\n\n"
-        
-        for i, service in enumerate(available_services, 1):
-            title = service.get('title', 'Услуга')
-            price = service.get('price', 0)
-            duration = self._format_duration(service.get('duration', 0))
+        # Используем GPT для красивого форматирования списка услуг
+        try:
+            response = self.gpt_client.format_service_list(available_services, context)
+        except Exception as e:
+            self.logger.error(f"GPT formatting failed, using fallback: {e}")
+            # Fallback к базовому форматированию
+            user_name = context.get('user_name', '')
+            greeting = f"{user_name}, " if user_name else ""
+            response = f"{greeting}отлично! Я нашла доступные услуги для записи:\n\n"
             
-            response += f"{i}. {title}\n"
-            response += f"   💰 {price} руб. | ⏱ {duration}\n\n"
-        
-        response += "Напишите номер услуги (например, 1), чтобы выбрать её для записи."
+            for i, service in enumerate(available_services, 1):
+                title = service.get('title', 'Услуга')
+                price = service.get('price', 0)
+                duration = self._format_duration(service.get('duration', 0))
+                
+                response += f"{i}. {title}\n"
+                response += f"   💰 {price} руб. | ⏱ {duration}\n\n"
+            
+            response += "Напишите номер услуги (например, 1), чтобы выбрать её для записи."
         
         return response, {"type": "services_shown", "count": len(available_services)}
     
@@ -491,15 +525,26 @@ class GPTOrchestrator:
     def _has_available_masters(self, service: Dict[str, Any]) -> bool:
         """Проверяет, есть ли у услуги доступные мастера."""
         companies = service.get('companies', [])
-        for company in companies:
-            if isinstance(company, dict):
-                staff = company.get('staff', [])
-                if staff and len(staff) > 0:
-                    for staff_member in staff:
-                        if isinstance(staff_member, dict):
-                            booking_dates = staff_member.get('booking_dates', [])
-                            if booking_dates and len(booking_dates) > 0:
-                                return True
+        
+        # Если есть хотя бы одна компания, считаем услугу доступной
+        if companies and len(companies) > 0:
+            # Проверяем полную структуру с мастерами (если есть)
+            for company in companies:
+                if isinstance(company, dict):
+                    staff = company.get('staff', [])
+                    if staff and len(staff) > 0:
+                        for staff_member in staff:
+                            if isinstance(staff_member, dict):
+                                booking_dates = staff_member.get('booking_dates', [])
+                                if booking_dates and len(booking_dates) > 0:
+                                    return True
+                # Если компания задана как строка ID, считаем доступной
+                elif isinstance(company, str):
+                    return True
+            
+            # Если есть компании-объекты без мастеров, тоже считаем доступной
+            return True
+        
         return False
     
     def _get_available_dates(self, service: Dict[str, Any]) -> List[str]:
@@ -706,3 +751,4 @@ class GPTOrchestrator:
             response += "• Салон: +375445903030 (пн–вс 9:00–21:00)"
         
         return response
+    
