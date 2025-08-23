@@ -177,13 +177,13 @@ class SearchModule:
     
     def get_service_details_by_ids(self, service_ids: List[str]) -> List[Dict[str, Any]]:
         """
-        Получает детальную информацию об услугах по их ID из облегченного файла.
+        Получает детальную информацию об услугах по их ID из полного файла с данными о мастерах.
         
         Args:
             service_ids: Список ID услуг
             
         Returns:
-            Список словарей с информацией об услугах
+            Список словарей с информацией об услугах включая данные о мастерах
             
         Raises:
             SearchModuleError: При ошибке получения данных
@@ -195,7 +195,8 @@ class SearchModule:
             return []
         
         try:
-            services_data = self.load_light_services()
+            # Используем полный файл services.json для получения данных о мастерах
+            services_data = self.data_loader.load_services_json()
             items = services_data.get('data', {}).get('items', [])
             
             # Создаем индекс для быстрого поиска

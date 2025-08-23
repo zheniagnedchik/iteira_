@@ -132,6 +132,9 @@ class GPTOrchestrator:
             elif action.action_type == 'ask_visit_history':
                 return self._handle_visit_history(action, context)
             
+            elif action.action_type == 'ask_service_clarification':
+                return self._handle_service_clarification(action, context)
+            
             elif action.action_type == 'show_services' or action.action_type == 'show_service_list':
                 return self._handle_show_services(action, context)
             
@@ -212,9 +215,242 @@ class GPTOrchestrator:
         
         return response, {"type": "visit_history_collected"}
     
+    def _handle_service_clarification(self, action: DialogAction, context: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """Задает уточняющие вопросы на основе найденных услуг."""
+        service_query = action.parameters.get('service_query', '') or action.parameters.get('service_type', '')
+        
+        # Если нет запроса в параметрах, извлекаем из последнего сообщения пользователя
+        if not service_query:
+            dialog_history = context.get('dialog_history', [])
+            if dialog_history:
+                for msg in reversed(dialog_history):
+                    if msg.get('role') == 'user':
+                        service_query = msg.get('message', '')
+                        break
+        
+        self.logger.debug(f"Creating clarification for query: '{service_query}'")
+        
+        # Получаем услуги по запросу
+        available_services = self._get_services_with_masters(service_query)
+        
+        if not available_services:
+            # Если услуг нет, возвращаем общий вопрос
+            response = (
+                "Чтобы подобрать для Вас наиболее подходящие процедуры, "
+                "расскажите пожалуйста подробнее о том, что Вас беспокоит?\n\n"
+                "Это поможет мне предложить именно те услуги, которые будут наиболее эффективны в Вашем случае."
+            )
+            return response, {"type": "service_clarification", "query": service_query}
+        
+        # Обновляем состояние и сохраняем найденные услуги
+        context['current_state'] = 'clarifying_service'
+        context['available_services'] = available_services
+        context['original_query'] = service_query
+        
+        # Генерируем уточняющие вопросы на основе найденных услуг через GPT
+        try:
+            response = self._generate_clarification_questions(available_services, service_query)
+        except Exception as e:
+            self.logger.error(f"Failed to generate clarification questions: {e}")
+            # Fallback к простому списку
+            return self._handle_show_services(action, context)
+        
+        return response, {"type": "service_clarification", "query": service_query, "services_count": len(available_services)}
+    
+    def _generate_clarification_questions(self, services: List[Dict[str, Any]], query: str) -> str:
+        """Генерирует уточняющие вопросы на основе найденных услуг через GPT."""
+        
+        # Подготавливаем данные об услугах для анализа
+        services_summary = []
+        categories = set()
+        
+        for service in services:
+            title = service.get('title', '')
+            category = service.get('category', '')
+            price = service.get('price', 0)
+            
+            services_summary.append({
+                'title': title,
+                'category': category,
+                'price': price
+            })
+            categories.add(category)
+        
+        # Создаем промпт для GPT
+        services_data = {
+            'query': query,
+            'services': services_summary,
+            'categories': list(categories),
+            'total_count': len(services)
+        }
+        
+        prompt = f"""
+Ты - консультант салона красоты. Пользователь написал: "{query}"
+
+Система нашла {len(services)} услуг в следующих категориях: {', '.join(categories)}
+
+Твоя задача - создать 2-4 уточняющих вопроса, чтобы помочь пользователю выбрать наиболее подходящие услуги из найденных.
+
+ВАЖНО:
+- Вопросы должны быть основаны на РЕАЛЬНЫХ найденных услугах и их категориях
+- НЕ придумывай категории, которых нет в списке
+- Используй эмодзи для визуального оформления
+- Сделай вопросы конкретными и понятными
+- Добавь опцию "или опишите подробнее"
+
+Найденные услуги:
+{chr(10).join([f"- {s['title']} ({s['category']}) - {s['price']} руб." for s in services_summary[:10]])}
+
+Формат ответа:
+Понимаю Вашу проблему. Чтобы подобрать наиболее подходящее решение, уточните пожалуйста:
+
+🔍 [Основной вопрос]
+1️⃣ [Вариант 1]
+2️⃣ [Вариант 2]
+3️⃣ [Вариант 3]
+[4️⃣ Вариант 4 - если нужен]
+
+Или опишите свою проблему подробнее.
+"""
+        
+        try:
+            messages = [
+                {
+                    "role": "system",
+                    "content": "Ты - эксперт по созданию уточняющих вопросов для салона красоты. Создавай вопросы только на основе предоставленных данных об услугах."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+            
+            response = self.gpt_client._make_request(messages, temperature=0.7)
+            return response
+            
+        except Exception as e:
+            self.logger.error(f"Failed to generate clarification via GPT: {e}")
+            raise
+    
+    def _filter_services_by_clarification(self, context: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """Фильтрует уже найденные услуги на основе ответа пользователя на уточняющие вопросы."""
+        
+        available_services = context.get('available_services', [])
+        original_query = context.get('original_query', '')
+        
+        # Получаем последний ответ пользователя
+        dialog_history = context.get('dialog_history', [])
+        user_clarification = ""
+        if dialog_history:
+            for msg in reversed(dialog_history):
+                if msg.get('role') == 'user':
+                    user_clarification = msg.get('message', '')
+                    break
+        
+        self.logger.debug(f"Filtering {len(available_services)} services based on clarification: '{user_clarification}'")
+        
+        try:
+            # Используем GPT для интеллектуальной фильтрации услуг
+            filtered_services = self._filter_services_with_gpt(
+                services=available_services,
+                original_query=original_query,
+                user_clarification=user_clarification
+            )
+            
+            if not filtered_services:
+                # Если фильтрация не дала результатов, показываем все найденные услуги
+                self.logger.warning("Filtering returned no results, showing all services")
+                filtered_services = available_services
+            
+            # Обновляем контекст
+            context['available_services'] = filtered_services
+            context['current_state'] = 'service_selection'  # Переходим к выбору услуги
+            
+            # Форматируем отфильтрованный список
+            response = self.gpt_client.format_service_list(filtered_services, context)
+            
+            return response, {"type": "services_shown", "count": len(filtered_services), "filtered": True}
+            
+        except Exception as e:
+            self.logger.error(f"Failed to filter services: {e}")
+            # Fallback - показываем все найденные услуги
+            response = self.gpt_client.format_service_list(available_services, context)
+            return response, {"type": "services_shown", "count": len(available_services), "filtered": False}
+    
+    def _filter_services_with_gpt(self, services: List[Dict[str, Any]], original_query: str, user_clarification: str) -> List[Dict[str, Any]]:
+        """Фильтрует услуги с помощью GPT на основе уточнения пользователя."""
+        
+        # Подготавливаем данные для GPT
+        services_data = []
+        for i, service in enumerate(services):
+            services_data.append({
+                'index': i,
+                'id': service.get('id', ''),
+                'title': service.get('title', ''),
+                'category': service.get('category', ''),
+                'price': service.get('price', 0),
+                'description': service.get('description', '')[:200]  # Ограничиваем описание
+            })
+        
+        prompt = f"""
+Пользователь изначально спросил: "{original_query}"
+Затем уточнил: "{user_clarification}"
+
+Из предложенного списка услуг выбери 2-4 наиболее подходящих на основе уточнения пользователя.
+
+Услуги:
+{chr(10).join([f"{i}. {s['title']} ({s['category']}) - {s['price']} руб." for i, s in enumerate(services_data)])}
+
+ВАЖНО:
+- Анализируй уточнение пользователя и выбирай наиболее релевантные услуги
+- Если пользователь выбрал номер (1, 2, 3), то учитывай соответствие этому номеру из предыдущих вопросов
+- Если пользователь описал конкретные симптомы/предпочтения, выбирай подходящие услуги
+- Верни ТОЛЬКО индексы выбранных услуг в JSON формате
+
+Формат ответа:
+{{"selected_indices": [0, 2, 3]}}
+"""
+        
+        try:
+            messages = [
+                {
+                    "role": "system", 
+                    "content": "Ты - эксперт по фильтрации услуг салона красоты. Анализируй уточнения пользователя и выбирай наиболее подходящие услуги."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+            
+            response = self.gpt_client._make_request(messages, temperature=0.3)
+            
+            # Парсим JSON ответ
+            import json
+            result = json.loads(response)
+            selected_indices = result.get('selected_indices', [])
+            
+            # Возвращаем отфильтрованные услуги
+            filtered_services = []
+            for index in selected_indices:
+                if 0 <= index < len(services):
+                    filtered_services.append(services[index])
+            
+            self.logger.info(f"GPT filtered services: {len(services)} → {len(filtered_services)}")
+            return filtered_services
+            
+        except Exception as e:
+            self.logger.error(f"GPT filtering failed: {e}")
+            raise
+    
     def _handle_show_services(self, action: DialogAction, context: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         """Показывает список доступных услуг."""
         service_query = action.parameters.get('service_query', '') or action.parameters.get('service_type', '')
+        
+        # КРИТИЧНО: Если мы в состоянии уточнения и есть уже найденные услуги - фильтруем их
+        if context.get('current_state') == 'clarifying_service' and context.get('available_services'):
+            self.logger.debug("Filtering existing services based on user clarification")
+            return self._filter_services_by_clarification(context)
         
         # Если нет запроса в параметрах, попробуем извлечь из последнего сообщения пользователя
         if not service_query:

@@ -172,70 +172,8 @@ class TelegramBot:
             
             await self.handle_message(fake_update, context)
     
-    def _is_greeting_message(self, message: str) -> bool:
-        """Проверяет, является ли сообщение приветствием."""
-        greetings = [
-            'привет', 'здравствуйте', 'добрый день', 'добрый вечер', 'добрый утро',
-            'hi', 'hello', 'hey', 'салам', 'хай', 'здарова', 'приветик',
-            'добро пожаловать', 'рад знакомству', 'начнем', 'давайте начнем'
-        ]
-        
-        message_lower = message.lower().strip()
-        return any(greeting in message_lower for greeting in greetings)
-    
-    def _is_general_question(self, message: str) -> bool:
-        """Проверяет, является ли сообщение общим вопросом."""
-        general_patterns = [
-            'как дела', 'что делаешь', 'кто ты', 'что ты умеешь',
-            'расскажи о себе', 'помоги', 'что можешь', 'как работаешь',
-            'спасибо', 'благодарю', 'отлично', 'хорошо', 'понятно'
-        ]
-        
-        message_lower = message.lower().strip()
-        return any(pattern in message_lower for pattern in general_patterns)
-    
-    def _generate_greeting_response(self, user_name: str = None) -> str:
-        """Генерирует приветственное сообщение в стиле Итейра."""
-        name_part = f", {user_name}" if user_name else ""
-        
-        return (
-            f"Здравствуйте{name_part}!\n\n"
-            "Рады приветствовать Вас в Итейра — сети салонов премиум‑класса.\n\n"
-            "Я — Ваш персональный виртуальный помощник.\n\n"
-            "С удовольствием помогу Вам с выбором процедуры, уточнением стоимости "
-            "или записью на удобное время.\n\n"
-            "Пожалуйста, сообщите, как к Вам можно обращаться."
-        )
-    
-    def _generate_general_response(self, message: str) -> str:
-        """Генерирует ответ на общие вопросы."""
-        message_lower = message.lower()
-        
-        if any(word in message_lower for word in ['спасибо', 'благодарю']):
-            return (
-                "Пожалуйста! Рада была помочь.\n\n"
-                "Если у Вас есть еще вопросы о наших процедурах или услугах, "
-                "обращайтесь в любое время."
-            )
-        
-        if any(word in message_lower for word in ['кто ты', 'что ты', 'расскажи о себе']):
-            return (
-                "Я — виртуальный консультант салонов красоты Итейра.\n\n"
-                "Могу помочь Вам:\n"
-                "• Подобрать подходящие процедуры\n"
-                "• Рассказать о наших услугах\n"
-                "• Уточнить стоимость и длительность\n"
-                "• Предоставить информацию о мастерах\n"
-                "• Помочь с записью на процедуры\n\n"
-                "Просто опишите, что Вас интересует!"
-            )
-        
-        return (
-            "Спасибо за Ваше сообщение!\n\n"
-            "Я готова помочь Вам с выбором процедур в наших салонах красоты.\n\n"
-            "Расскажите, какая процедура Вас интересует, или задайте любой вопрос "
-            "о наших услугах."
-        )
+    # Все сообщения теперь обрабатываются через GPT-оркестратор
+    # Хардкод-методы удалены для полной GPT-driven архитектуры
 
     @log_operation("telegram_handle_message")
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
