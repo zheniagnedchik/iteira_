@@ -182,21 +182,58 @@ class DialogAssistant:
                     if selected_date and selected_time and service1_data and service2_data:
                         # Получаем все комбо-слоты и находим подходящий
                         all_combo_slots = self._get_combo_time_slots(service1_data, service2_data, selected_date)
-                        # Находим слот, который начинается в выбранное время
-                        for slot in all_combo_slots:
-                            if slot.get('start_time') == selected_time:
-                                time_slots = [slot]  # Передаем конкретный слот
+                        self.logger.info(f"Для select_time_combo получено {len(all_combo_slots)} комбо-слотов")
+                        self.logger.info(f"Ищем слот для времени: '{selected_time}'")
+                        
+                        # Находим группу, которая начинается в выбранное время
+                        found_slot_data = None
+                        
+                        for i, slot_data in enumerate(all_combo_slots):
+                            # all_combo_slots содержит структуру с sequential_groups
+                            sequential_groups = slot_data.get('sequential_groups', [])
+                            self.logger.info(f"Слот-данные {i}: {len(sequential_groups)} sequential_groups")
+                            
+                            # Ищем группу с нужным временем
+                            for j, group in enumerate(sequential_groups):
+                                group_start_time = group.get('start_time', '')
+                                self.logger.info(f"  Группа {j}: start_time='{group_start_time}'")
+                                if group_start_time == selected_time:
+                                    # Создаём специальную структуру для выбранного времени
+                                    found_slot_data = {
+                                        'sequential_groups': [group],  # Только выбранная группа
+                                        'selected_time': selected_time,
+                                        'total_sequential': 1
+                                    }
+                                    self.logger.info(f"НАЙДЕН подходящий слот для времени {selected_time}")
+                                    break
+                            
+                            if found_slot_data:
                                 break
+                        
+                        if found_slot_data:
+                            time_slots = [found_slot_data]  # Передаем конкретную группу
+                            self.logger.info(f"time_slots установлен: выбранная группа для времени {selected_time}")
+                        else:
+                            self.logger.warning(f"НЕ НАЙДЕН слот для времени '{selected_time}' среди групп")
+                            # Показываем доступные времена для дебага
+                            for slot_data in all_combo_slots:
+                                sequential_groups = slot_data.get('sequential_groups', [])
+                                for group in sequential_groups[:3]:  # Первые 3
+                                    available_time = group.get('start_time', 'НЕТ_ВРЕМЕНИ')
+                                    self.logger.info(f"Доступное время: {available_time}")
+                            # В качестве fallback берём все слоты
+                            if all_combo_slots:
+                                time_slots = all_combo_slots
+                                self.logger.info(f"Fallback: используем все {len(all_combo_slots)} слот-данных")
+            
+            # Сохраняем слоты времени в контексте ПЕРЕД обновлением
+            if decision.get('action') in ['show_time_slots', 'select_time_combo'] and time_slots:
+                # Сохраняем оригинальные слоты для использования в clarify_time_period и booking confirmation
+                context['last_time_slots'] = time_slots
+                self.logger.info(f"Сохранены last_time_slots для {decision.get('action')}: {len(time_slots)} слотов")
             
             # Генерируем ответ
             response = self._generate_dialog_response(decision, context, services_data, time_slots, available_dates)
-            
-            # Сохраняем слоты времени в контексте для clarify_time_period
-            if decision.get('action') == 'show_time_slots' and time_slots:
-                # Сохраняем оригинальные слоты для использования в clarify_time_period
-                context['last_time_slots'] = time_slots
-            
-
             
             # Сохраняем services_data для комбо перед обновлением контекста
             if decision.get('action') in ['ask_combo_services', 'search_services'] and services_data:
@@ -222,8 +259,20 @@ class DialogAssistant:
             
             # СПЕЦИАЛЬНАЯ ЛОГИКА: После select_time_combo сразу переходим к подтверждению
             if decision.get('action') == 'select_time_combo':
-                self.logger.info("После select_time_combo переходим к процессу подтверждения")
-                updated_context['needs_booking_confirmation'] = True
+                self.logger.info("После select_time_combo начинаем процесс подтверждения комбо-записи")
+                
+                # Подготавливаем детали комбо-записи и запускаем подтверждение
+                booking_details = self._prepare_combo_booking_details(updated_context, decision)
+                confirmation_response, confirmation_context = self.booking_confirmation.start_booking_confirmation(booking_details)
+                
+                # Обновляем контекст данными из подтверждения
+                updated_context.update(confirmation_context)
+                
+                return {
+                    'response': confirmation_response,
+                    'context': updated_context,
+                    'action': 'booking_confirmation'
+                }
             
             return {
                 'response': response['text'],
@@ -1348,6 +1397,10 @@ class DialogAssistant:
     def _prepare_booking_details(self, context: Dict[str, Any], decision: Dict[str, Any]) -> Dict[str, Any]:
         """Подготавливает детали записи для системы подтверждения"""
         try:
+            # Проверяем, это комбо-запись или обычная
+            if context.get('is_combo') and context.get('combo_service1') and context.get('combo_service2'):
+                return self._prepare_combo_booking_details(context, decision)
+            
             selected_service = context.get('selected_service', {})
             selected_date = context.get('selected_date', '')
             selected_time = context.get('selected_time', '')
@@ -1399,6 +1452,135 @@ class DialogAssistant:
             self.logger.error(f"Ошибка при подготовке деталей записи: {e}")
             return {
                 'service_name': 'Услуга',
+                'master_name': 'Мастер',
+                'date_time': 'Дата и время',
+                'location': 'Салон красоты Итейра',
+                'address': 'Минск, ул. Немига, 5 (2 этаж)',
+                'salon_phone': '+375445903030'
+            }
+
+    def _prepare_combo_booking_details(self, context: Dict[str, Any], decision: Dict[str, Any]) -> Dict[str, Any]:
+        """Подготавливает детали комбо-записи для подтверждения"""
+        try:
+            combo_service1 = context.get('combo_service1', {})
+            combo_service2 = context.get('combo_service2', {})
+            selected_date = context.get('selected_date', '')
+            selected_time = context.get('selected_time', '')
+            client_name = context.get('user_name', context.get('client_name', 'Клиент'))
+            
+            # Получаем информацию о мастерах из last_time_slots
+            last_time_slots = context.get('last_time_slots', [])
+            master1_name = 'уточняется'
+            master2_name = 'уточняется'
+            service1_time = selected_time
+            service2_time = selected_time
+            
+            self.logger.info(f"Извлечение мастеров из last_time_slots: {len(last_time_slots)} элементов")
+            
+            if last_time_slots and len(last_time_slots) > 0:
+                slot_data = last_time_slots[0]
+                self.logger.info(f"Структура slot_data: {list(slot_data.keys()) if isinstance(slot_data, dict) else type(slot_data)}")
+                
+                # Для комбо last_time_slots содержит специальную структуру
+                if isinstance(slot_data, dict) and 'sequential_groups' in slot_data:
+                    sequential_groups = slot_data.get('sequential_groups', [])
+                    self.logger.info(f"Найдено {len(sequential_groups)} sequential_groups")
+                    
+                    if sequential_groups and len(sequential_groups) > 0:
+                        # Ищем группу с нужным временем
+                        target_group = None
+                        for group in sequential_groups:
+                            if group.get('start_time') == selected_time:
+                                target_group = group
+                                break
+                        
+                        # Если не нашли точное время, берём первую группу
+                        if not target_group and sequential_groups:
+                            target_group = sequential_groups[0]
+                            
+                        if target_group:
+                            first_service = target_group.get('first_service', {})
+                            second_service = target_group.get('second_service', {})
+                            master1_name = first_service.get('master_name', 'уточняется')
+                            master2_name = second_service.get('master_name', 'уточняется')
+                            service1_time = first_service.get('start', selected_time)
+                            service2_time = second_service.get('start', selected_time)
+                            
+                            self.logger.info(f"Извлечены мастера: {master1_name}, {master2_name}")
+                            self.logger.info(f"Времена услуг: {service1_time} -> {service2_time}")
+                else:
+                    # Обычный слот или другая структура
+                    self.logger.info("Обрабатываем как обычный слот")
+                    master1_name = slot_data.get('master1_name', slot_data.get('master_name', 'уточняется'))
+                    master2_name = slot_data.get('master2_name', 'уточняется')
+                    service1_time = slot_data.get('service1_time', selected_time)
+                    service2_time = slot_data.get('service2_time', selected_time)
+                    
+                    self.logger.info(f"Из обычного слота: {master1_name}, {master2_name}")
+            else:
+                self.logger.warning("last_time_slots пустой или отсутствует")
+            
+            # Форматируем комбинированное название услуги
+            combo_service_name = f"{combo_service1.get('title', 'Услуга 1')} + {combo_service2.get('title', 'Услуга 2')}"
+            
+            # Форматируем детальное описание с расписанием
+            if master1_name != 'уточняется' and master2_name != 'уточняется':
+                # Детальное описание с конкретными мастерами и временем
+                from datetime import datetime, timedelta
+                try:
+                    start_dt = datetime.strptime(service1_time, '%H:%M')
+                    end_first_dt = start_dt + timedelta(hours=2)  # Окрашивание ~2 часа
+                    start_second_dt = datetime.strptime(service2_time, '%H:%M')
+                    end_second_dt = start_second_dt + timedelta(hours=1)  # Маникюр ~1 час
+                    
+                    detailed_description = f"""
+🕐 Детальное расписание:
+• {service1_time}-{end_first_dt.strftime('%H:%M')}: {combo_service1.get('title')} (мастер: {master1_name})
+• {service2_time}-{end_second_dt.strftime('%H:%M')}: {combo_service2.get('title')} (мастер: {master2_name})
+
+⏱️ Общее время: с {service1_time} до {end_second_dt.strftime('%H:%M')}"""
+                    
+                except:
+                    detailed_description = f"Мастера: {master1_name} ({combo_service1.get('title')}), {master2_name} ({combo_service2.get('title')})"
+            else:
+                detailed_description = "Мастера уточняются администратором"
+            
+            # Форматируем дату и время
+            formatted_date_time = self._format_date_time_for_booking(selected_date, selected_time)
+            
+            # Общая стоимость
+            total_price = combo_service1.get('price', 0) + combo_service2.get('price', 0)
+            
+            # Локация (по умолчанию салон для большинства комбо)
+            location_info = self.locations['salon']
+            
+            booking_details = {
+                'service_name': combo_service_name,
+                'master_name': detailed_description,
+                'date_time': formatted_date_time,
+                'location': location_info['name'],
+                'address': location_info['address'],
+                'salon_phone': location_info['phone'],
+                'price': total_price,
+                'selected_date': selected_date,
+                'selected_time': selected_time,
+                'client_name': client_name,
+                'is_combo': True,
+                'combo_service1': combo_service1,
+                'combo_service2': combo_service2,
+                'master1_name': master1_name,
+                'master2_name': master2_name,
+                'service1_time': service1_time,
+                'service2_time': service2_time
+            }
+            
+            self.logger.info(f"Подготовлены детали комбо-записи: {combo_service_name} на {formatted_date_time}")
+            return booking_details
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка при подготовке деталей комбо-записи: {e}")
+            return {
+                'service_name': 'Комбо-услуга',
                 'master_name': 'Мастер',
                 'date_time': 'Дата и время',
                 'location': 'Салон красоты Итейра',
@@ -1736,6 +1918,8 @@ EXTRACT_TIME: [конкретное время, если упомянуто, н�
 
 🚨 ТРИГГЕРЫ ДЛЯ SHOW_DATES В КОМБО:
 - "в один день" → show_dates
+- "один день" → show_dates
+- "один" → show_dates
 - "одну дату" → show_dates  
 - "вместе" → show_dates
 - "совместно" → show_dates
