@@ -12,10 +12,41 @@ import logging
 logging.disable(logging.CRITICAL)
 
 from beauty_salon_rag.dialog_orchestrator import DialogOrchestrator
+from beauty_salon_rag.gpt_client import GPTClient
+from beauty_salon_rag.modules.data_loader import DataLoader
+
+def clear_all_caches_and_context():
+    """Полностью очищает весь кеш и контекст системы"""
+    try:
+        # Очищаем кеш GPT клиента
+        gpt_client = GPTClient()
+        gpt_client.clear_cache()
+        print("✅ Кеш GPT клиента очищен")
+        
+        # Очищаем кеш данных
+        data_loader = DataLoader()
+        data_loader.clear_cache()
+        print("✅ Кеш данных очищен")
+        
+    except Exception as e:
+        print(f"⚠️ Ошибка при очистке кеша: {e}")
+
+def clear_user_context(orchestrator, user_id):
+    """Очищает контекст пользователя"""
+    try:
+        orchestrator.clear_user_context(user_id)
+        print(f"✅ Контекст пользователя {user_id} очищен")
+    except Exception as e:
+        print(f"⚠️ Ошибка при очистке контекста: {e}")
 
 def main():
     print("ДИАЛОГ ПОСЛЕДОВАТЕЛЬНЫХ ЗАПИСЕЙ")
     print("=" * 60)
+    print()
+    
+    # Полная очистка кеша и контекста перед стартом
+    print("🧹 Очистка системы перед стартом:")
+    clear_all_caches_and_context()
     print()
     
     config = {
@@ -28,6 +59,9 @@ def main():
     
     user_id = "test"
     context = {}
+    
+    # Дополнительно очищаем контекст пользователя
+    clear_user_context(orchestrator, user_id)
     
     steps = [
         # Первая запись - маникюр (полный цикл)
