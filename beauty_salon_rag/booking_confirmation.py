@@ -110,9 +110,26 @@ class BookingConfirmation:
         user_input = user_message.strip().lower()
         
         if user_input in ['да', 'yes', 'ок', 'окей', 'согласен', 'подтверждаю']:
-            message = "Отлично! Для записи мне нужны ваши данные.\n\nВведите ваше имя:"
-            context['booking_stage'] = 'collect_first_name'
-            return message, context
+            # Проверяем, есть ли сохраненные данные пользователя
+            saved_user_data = context.get('saved_user_data', {})
+            
+            if saved_user_data and saved_user_data.get('first_name') and saved_user_data.get('last_name') and saved_user_data.get('phone'):
+                # Используем сохраненные данные
+                context['personal_data'] = {
+                    'first_name': saved_user_data['first_name'],
+                    'last_name': saved_user_data['last_name'],
+                    'phone': saved_user_data['phone']
+                }
+                context['booking_stage'] = 'final_confirmation'
+                
+                message = f"Отлично! Использую ваши данные из предыдущей записи.\n\n{self._format_final_confirmation(context)}"
+                self.logger.info(f"Использованы сохраненные данные пользователя: {saved_user_data['first_name']} {saved_user_data['last_name']}")
+                return message, context
+            else:
+                # Запрашиваем данные как обычно
+                message = "Отлично! Для записи мне нужны ваши данные.\n\nВведите ваше имя:"
+                context['booking_stage'] = 'collect_first_name'
+                return message, context
             
         elif user_input in ['нет', 'no', 'отмена', 'не хочу', 'передумал']:
             message = "Понятно! Если захотите записаться позже - просто напишите мне ✨"
@@ -164,21 +181,66 @@ class BookingConfirmation:
     
     def _handle_phone_collection(self, user_message: str, context: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         """Обрабатывает сбор телефона"""
-        phone = user_message.strip()
-        
-        # Валидация телефона
-        if not self._validate_phone(phone):
-            message = """Пожалуйста, введите номер телефона в корректном международном формате.
-Примеры: +375291234567, +79161234567, +14155550100"""
+        try:
+            phone = user_message.strip()
+            
+            # Проверяем, не ввел ли пользователь фамилию вместо телефона
+            if not phone.startswith('+') and len(phone) < 10 and phone.isalpha():
+                # Это похоже на фамилию, а не на телефон
+                self.logger.info(f"Пользователь ввел '{phone}' вместо телефона - возможно, это фамилия")
+                
+                # Если фамилия еще не сохранена, сохраняем ее
+                if not context.get('personal_data', {}).get('last_name'):
+                    if 'personal_data' not in context:
+                        context['personal_data'] = {}
+                    context['personal_data']['last_name'] = phone
+                    self.logger.info(f"Сохранена фамилия: {phone}")
+                
+                message = """Спасибо за фамилию! Теперь укажите номер телефона в международном формате.
+
+Примеры корректных номеров:
+• +375291234567 (Беларусь)
+• +79161234567 (Россия) 
+• +14155550100 (США)
+
+Номер должен начинаться с + и содержать код страны."""
+                # Остаемся на этапе сбора телефона
+                return message, context
+            
+            # Валидация телефона
+            if not self._validate_phone(phone):
+                self.logger.warning(f"Неверный формат телефона: '{phone}'")
+                message = """Пожалуйста, введите номер телефона в корректном международном формате.
+
+Примеры корректных номеров:
+• +375291234567 (Беларусь)
+• +79161234567 (Россия) 
+• +14155550100 (США)
+
+Номер должен начинаться с + и содержать код страны."""
+                # НЕ меняем booking_stage - остаемся на сборе телефона
+                return message, context
+            
+            # Очищаем номер от лишних символов для хранения
+            clean_phone = re.sub(r'[^\d+]', '', phone)
+            
+            # Сохраняем телефон (НЕ в GPT!)
+            if 'personal_data' not in context:
+                context['personal_data'] = {}
+            context['personal_data']['phone'] = clean_phone
+            context['booking_stage'] = 'final_confirmation'
+            
+            self.logger.info(f"Телефон успешно сохранен, переход к финальному подтверждению")
+            
+            # Формируем финальное подтверждение с маскированными данными
+            message = self._format_final_confirmation(context)
             return message, context
-        
-        # Сохраняем телефон (НЕ в GPT!)
-        context['personal_data']['phone'] = phone
-        context['booking_stage'] = 'final_confirmation'
-        
-        # Формируем финальное подтверждение с маскированными данными
-        message = self._format_final_confirmation(context)
-        return message, context
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка при обработке телефона '{user_message}': {e}")
+            message = "Произошла ошибка при обработке номера телефона. Попробуйте еще раз:"
+            # НЕ меняем booking_stage - остаемся на сборе телефона
+            return message, context
     
     def _handle_final_confirmation(self, user_message: str, context: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         """Обрабатывает финальное подтверждение"""
@@ -189,9 +251,35 @@ class BookingConfirmation:
             booking_id = self._create_booking(context)
             message = self._format_success_message(context, booking_id)
             
-            # Очищаем персональные данные из контекста после создания записи
+            # ПОЛНОСТЬЮ очищаем контекст после создания записи
             context['booking_stage'] = 'completed'
-            # НЕ удаляем personal_data - они могут понадобиться для логирования
+            
+            # Сохраняем данные пользователя для будущих записей
+            personal_data = context.get('personal_data', {})
+            user_data = {
+                'first_name': personal_data.get('first_name'),
+                'last_name': personal_data.get('last_name'), 
+                'phone': personal_data.get('phone'),
+                'user_name': context.get('user_name')
+            }
+            
+            # Очищаем данные о записи, но сохраняем пользовательские данные
+            context.pop('booking_details', None)
+            context.pop('personal_data', None)
+            context.pop('selected_service', None)
+            context.pop('selected_date', None)
+            context.pop('selected_time', None)
+            context.pop('selected_master', None)
+            context.pop('is_combo', None)
+            context.pop('combo_service1', None)
+            context.pop('combo_service2', None)
+            context.pop('last_time_slots', None)
+            context.pop('_temp_services_data', None)
+            
+            # Сохраняем данные пользователя для повторных записей
+            context['saved_user_data'] = user_data
+            
+            self.logger.info(f"Запись {booking_id} создана, данные пользователя сохранены для повторных записей")
             
             return message, context
             
@@ -210,9 +298,36 @@ class BookingConfirmation:
     
     def _validate_phone(self, phone: str) -> bool:
         """Валидирует номер телефона"""
-        # Простая регулярка для международного формата
-        pattern = r'^\+\d{10,15}$'
-        return bool(re.match(pattern, phone))
+        try:
+            # Убираем все лишние символы
+            clean_phone = re.sub(r'[^\d+]', '', phone)
+            
+            # Проверяем основные критерии
+            if not clean_phone.startswith('+'):
+                return False
+            
+            # Убираем плюс для подсчета цифр
+            digits_only = clean_phone[1:]
+            
+            # Проверяем количество цифр (от 10 до 15 - международный стандарт)
+            if not digits_only.isdigit():
+                return False
+                
+            digit_count = len(digits_only)
+            if digit_count < 10 or digit_count > 15:
+                return False
+            
+            # Дополнительные проверки для распространенных форматов
+            # Беларусь: +375xxxxxxxxx (12 цифр)
+            # Россия: +7xxxxxxxxxx (11 цифр) 
+            # США: +1xxxxxxxxxx (11 цифр)
+            
+            self.logger.info(f"Валидация телефона: '{phone}' -> '{clean_phone}' ({digit_count} цифр) - OK")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка валидации телефона '{phone}': {e}")
+            return False
     
     def _format_final_confirmation(self, context: Dict[str, Any]) -> str:
         """Форматирует сообщение финального подтверждения с маскированными данными"""

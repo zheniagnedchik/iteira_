@@ -100,3 +100,4 @@ def test_laser_services():
 if __name__ == "__main__":
     print("🔬 Анализ услуг лазерной эпиляции\n")
     test_laser_services()
+

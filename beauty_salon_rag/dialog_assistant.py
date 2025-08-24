@@ -220,6 +220,11 @@ class DialogAssistant:
             # Обновляем контекст
             updated_context = self._update_dialog_context(context, decision, response)
             
+            # СПЕЦИАЛЬНАЯ ЛОГИКА: После select_time_combo сразу переходим к подтверждению
+            if decision.get('action') == 'select_time_combo':
+                self.logger.info("После select_time_combo переходим к процессу подтверждения")
+                updated_context['needs_booking_confirmation'] = True
+            
             return {
                 'response': response['text'],
                 'context': updated_context,
@@ -236,6 +241,193 @@ class DialogAssistant:
 
     def _make_dialog_decision(self, message: str, context: Dict[str, Any], stage: str) -> Dict[str, Any]:
         """Принимает решение о следующем действии в диалоге"""
+        
+        # КРИТИЧНАЯ ПРОВЕРКА: Если предыдущая запись завершена, очищаем контекст для новой записи
+        booking_stage = context.get('booking_stage')
+        if booking_stage == 'completed':
+            self.logger.info("Обнаружена завершенная запись, очищаем контекст для нового запроса")
+            # Сохраняем ТОЛЬКО данные пользователя, НЕ мастера
+            user_name = context.get('user_name')
+            saved_user_data = context.get('saved_user_data', {})
+            
+            # Проверяем, что user_name действительно принадлежит пользователю, а не мастеру
+            master_names = ['воронова', 'сакович', 'лазарева', 'калеко', 'баранова', 'кожух', 'матвеенко', 'радывонюк', 'станишевская']
+            if user_name and any(master_name in user_name.lower() for master_name in master_names):
+                self.logger.warning(f"Обнаружено имя мастера в user_name: {user_name} - очищаем")
+                user_name = None
+            
+            context.clear()
+            if user_name:
+                context['user_name'] = user_name
+                self.logger.info(f"Сохранено имя пользователя: {user_name}")
+            if saved_user_data and saved_user_data.get('user_name'):
+                # Используем имя из сохраненных данных как более надежный источник
+                context['user_name'] = saved_user_data['user_name']
+                context['saved_user_data'] = saved_user_data
+                self.logger.info(f"Восстановлено имя пользователя из сохраненных данных: {saved_user_data['user_name']}")
+            elif saved_user_data:
+                context['saved_user_data'] = saved_user_data
+                self.logger.info(f"Сохранены данные пользователя для повторных записей")
+        
+        # КРИТИЧНАЯ ПРОВЕРКА: Если есть ключевые слова последовательности, это НЕ комбо
+        sequence_keywords = ['еще', 'теперь', 'дополнительно', 'потом', 'после']
+        message_lower = message.lower()
+        is_sequence_request = any(keyword in message_lower for keyword in sequence_keywords)
+        
+        # КРИТИЧНАЯ ПРОВЕРКА: Комбо + дата = show_combo_time_slots
+        is_combo = context.get('is_combo')
+        has_combo_services = context.get('combo_service1') and context.get('combo_service2')
+        
+        # ВРЕМЕННАЯ ПРОВЕРКА: Если комбо начат, но вторая услуга не сохранена
+        has_combo_started = context.get('is_combo') and context.get('combo_service1')
+        
+        # Проверяем упоминание даты
+        import re
+        date_patterns = [r'\d{1,2}\s+августа', r'\d{1,2}\s+сентября', r'завтра', r'послезавтра', r'понедельник', r'вторник', r'среда', r'четверг', r'пятница', r'суббота', r'воскресенье']
+        has_date = any(re.search(pattern, message_lower) for pattern in date_patterns)
+        
+        # КРИТИЧНО: Принудительно добавляем combo_service2 ПЕРЕД проверкой
+        if has_combo_started and not context.get('combo_service2') and has_date:
+            # Получаем РЕАЛЬНУЮ вторую услугу с полными данными о мастерах
+            service1_title = context.get('combo_service1', {}).get('title', '').lower()
+            if 'окрашивание' in service1_title:
+                # Если первая - окрашивание, вторая - маникюр
+                search_query = "Маникюр классический"
+                self.logger.info(f"Поиск реальных данных для combo_service2: {search_query}")
+            else:
+                # В остальных случаях вторая - окрашивание
+                search_query = "Окрашивание"
+                self.logger.info(f"Поиск реальных данных для combo_service2: {search_query}")
+            
+            # Получаем ПОЛНЫЕ данные через search_with_details
+            try:
+                detailed_services = self.search_module.search_with_details(search_query)
+                if detailed_services:
+                    context['combo_service2'] = detailed_services[0]  # Берём первую найденную услугу
+                    self.logger.info(f"Добавлена combo_service2 с полными данными: {detailed_services[0].get('title')}")
+                    self.logger.info(f"Мастеров во второй услуге: {len(self._get_all_staff_for_service(detailed_services[0]))}")
+                else:
+                    # Fallback к старому методу если поиск не дал результатов
+                    context['combo_service2'] = {'title': search_query, 'price': 60 if 'маникюр' in search_query.lower() else 325}
+                    self.logger.warning(f"Поиск не дал результатов, используется fallback для: {search_query}")
+            except Exception as e:
+                # Fallback к старому методу при ошибке
+                context['combo_service2'] = {'title': search_query, 'price': 60 if 'маникюр' in search_query.lower() else 325}
+                self.logger.error(f"Ошибка поиска combo_service2: {e}, используется fallback")
+            
+            # Обновляем проверку после добавления
+            has_combo_services = context.get('combo_service1') and context.get('combo_service2')
+        
+        # Расширенная проверка: если комбо начат И дата названа
+        if (has_combo_services or has_combo_started) and has_date:
+            
+            # Система должна показать комбо-слоты, НЕ сразу записывать
+            self.logger.info(f"Обнаружена дата для комбо: '{message}' - переход к show_combo_time_slots")
+            return {
+                'action': 'show_combo_time_slots',
+                'stage': 'booking_confirmation',
+                'needs_services_data': True,
+                'extracted_info': {
+                    'date': message.strip()
+                }
+            }
+        
+        # КРИТИЧНАЯ ПРОВЕРКА: Комбо + конкретное время = select_time_combo  
+        # Проверяем упоминание ТОЛЬКО времени (формат чч:мм или чч мм БЕЗ "августа")
+        time_patterns = [r'^(\d{1,2}):(\d{2})$', r'^(\d{1,2})\s+(\d{2})$']
+        has_time = any(re.search(pattern, message.strip()) for pattern in time_patterns)
+        
+        # Альтернативная проверка: только числа без контекста даты
+        if not has_time and re.match(r'^\d{1,2}:\d{2}$', message.strip()):
+            has_time = True
+        elif not has_time and re.match(r'^\d{1,2}\s+\d{2}$', message.strip()):
+            has_time = True
+        
+        if (has_combo_services or has_combo_started) and has_time:
+            # Извлекаем время
+            for pattern in time_patterns:
+                match = re.search(pattern, message_lower)
+                if match:
+                    hour = match.group(1)
+                    minute = match.group(2) if match.group(2) else '00'
+                    selected_time = f"{hour.zfill(2)}:{minute}"
+                    self.logger.info(f"Обнаружено время для комбо: '{selected_time}' из сообщения: '{message}'")
+                    return {
+                        'action': 'select_time_combo',
+                        'stage': 'booking_confirmation',
+                        'needs_services_data': False,
+                        'extracted_info': {
+                            'time': selected_time
+                        }
+                    }
+        
+        # КРИТИЧНАЯ ПРОВЕРКА: Выбор мастера по имени
+        master_names = ['станишевская полина', 'воронова янина', 'сакович елена', 'лазарева екатерина', 
+                       'калеко андрей', 'баранова виктория', 'кожух татьяна', 'матвеенко надежда', 
+                       'радывонюк елена', 'сакович ольга']
+        
+        selected_master = None
+        for master_name in master_names:
+            if master_name in message_lower:
+                # Форматируем имя с заглавными буквами
+                selected_master = ' '.join(word.capitalize() for word in master_name.split())
+                self.logger.info(f"Обнаружен выбор мастера: '{selected_master}' из сообщения: '{message}'")
+                return {
+                    'action': 'book_appointment',
+                    'stage': 'booking_confirmation',
+                    'needs_services_data': False,
+                    'extracted_info': {
+                        'master_name': selected_master
+                    }
+                }
+        
+        # КРИТИЧНАЯ ПРОВЕРКА: Прямые запросы на запись с конкретной услугой
+        booking_keywords = ['запиши', 'записать', 'хочу записаться', 'нужно записаться']
+        service_keywords = ['окрашивание', 'маникюр', 'массаж', 'эпиляция', 'стрижка', 'укладка']
+        
+        has_booking_request = any(keyword in message_lower for keyword in booking_keywords)
+        has_service_mention = any(keyword in message_lower for keyword in service_keywords)
+        
+        if (is_sequence_request or has_booking_request) and has_service_mention:
+            self.logger.info(f"Обнаружен прямой запрос на запись услуги: '{message}' - переход к search_services")
+            return {
+                'action': 'search_services',
+                'stage': 'service_selection',
+                'needs_services_data': True,
+                'extracted_info': {
+                    'query': message.strip()
+                }
+            }
+        
+        # КРИТИЧНАЯ ПРОВЕРКА: Если есть выбранная услуга и пользователь называет конкретную дату
+        selected_service = context.get('selected_service')
+        if selected_service:
+            # Проверяем, упомянута ли конкретная дата в сообщении
+            import re
+            date_patterns = [
+                r'\b(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря))\b',
+                r'\b(завтра|послезавтра)\b',
+                r'\b(понедельник|вторник|среда|четверг|пятница|суббота|воскресенье)\b',
+                r'\b(следующий\s+\w+)\b'
+            ]
+            
+            date_mentioned = False
+            for pattern in date_patterns:
+                if re.search(pattern, message.lower()):
+                    date_mentioned = True
+                    break
+            
+            # Если упомянута дата и есть выбранная услуга - это ВСЕГДА show_time_slots
+            if date_mentioned:
+                self.logger.info(f"Обнаружена дата в сообщении '{message}' с выбранной услугой - принудительно используем show_time_slots")
+                return {
+                    'action': 'show_time_slots',
+                    'stage': 'booking_or_alternatives',
+                    'needs_services_data': True,  # Нужно для получения слотов времени
+                    'extracted_info': {
+                        'date': message.strip()  # Сохраняем оригинальное сообщение как дату
+                    }
+                }
         
         prompt = self._get_dialog_decision_prompt()
         
@@ -258,7 +450,39 @@ class DialogAssistant:
             )
             
             # Парсим ответ GPT в структурированный формат
-            return self._parse_decision_response(response)
+            decision = self._parse_decision_response(response)
+            
+            # КРИТИЧНАЯ ПОСТ-ОБРАБОТКА: Проверяем что GPT не ошибся с действием
+            # Если есть выбранная услуга и в сообщении упомянута дата, это ВСЕГДА show_time_slots
+            selected_service = context.get('selected_service')
+            if selected_service and decision.get('action') not in ['show_time_slots', 'show_combo_time_slots']:
+                # Проверяем упоминание конкретных дат
+                import re
+                date_patterns = [
+                    r'\b(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря))\b',
+                    r'\b(завтра|послезавтра)\b', 
+                    r'\b(понедельник|вторник|среда|четверг|пятница|суббота|воскресенье)\b',
+                    r'\b(следующий\s+\w+)\b'
+                ]
+                
+                date_mentioned = False
+                for pattern in date_patterns:
+                    if re.search(pattern, message.lower()):
+                        date_mentioned = True
+                        break
+                
+                if date_mentioned:
+                    self.logger.warning(f"GPT ошибся с действием {decision.get('action')} для даты+услуги. Исправляем на show_time_slots")
+                    decision = {
+                        'action': 'show_time_slots',
+                        'stage': 'booking_or_alternatives', 
+                        'needs_services_data': True,
+                        'extracted_info': {
+                            'date': message.strip()
+                        }
+                    }
+            
+            return decision
             
         except Exception as e:
             self.logger.error(f"Ошибка при принятии решения: {e}")
@@ -308,6 +532,27 @@ class DialogAssistant:
                     formatted_time_slots = f"Нет доступных мастеров для времени {selected_time}"
             else:
                 formatted_time_slots = "Нет сохраненных слотов времени"
+        
+        # Для select_time_combo форматируем детали комбо-записи  
+        elif decision.get('action') == 'select_time_combo':
+            if time_slots and len(time_slots) > 0:
+                slot = time_slots[0]
+                combo_details = {
+                    'service1_title': context.get('combo_service1', {}).get('title', 'Услуга 1'),
+                    'service2_title': context.get('combo_service2', {}).get('title', 'Услуга 2'),
+                    'service1_price': context.get('combo_service1', {}).get('price', 0),
+                    'service2_price': context.get('combo_service2', {}).get('price', 0),
+                    'master1_name': slot.get('master1_name', 'уточняется'),
+                    'master2_name': slot.get('master2_name', 'уточняется'),
+                    'service1_time': slot.get('service1_time', context.get('selected_time')),
+                    'service2_time': slot.get('service2_time', context.get('selected_time')),
+                    'selected_date': context.get('selected_date'),
+                    'total_price': context.get('combo_service1', {}).get('price', 0) + context.get('combo_service2', {}).get('price', 0)
+                }
+                formatted_time_slots = combo_details
+                self.logger.info(f"Подготовлены детали комбо для select_time_combo: {combo_details}")
+            else:
+                formatted_time_slots = "Нет данных о выбранном слоте"
         
         # Для book_appointment начинаем процесс подтверждения записи
         elif decision.get('action') == 'book_appointment':
@@ -1380,6 +1625,18 @@ EXTRACT_TIME: [конкретное время, если упомянуто, н�
 
 🚨 ПРИОРИТЕТ КОМБО: Если в сообщении есть "и", "плюс", "ещё", "также" между услугами - это КОМБО!
 
+🚨 ИСКЛЮЧЕНИЕ ДЛЯ ЗАВЕРШЕННЫХ ЗАПИСЕЙ:
+- Если в контексте booking_stage: 'completed' - предыдущая запись ЗАВЕРШЕНА
+- В таком случае новый запрос с "и" НЕ является комбо с предыдущей записью
+- Это НОВАЯ ОТДЕЛЬНАЯ запись, начинай с чистого листа
+- Пример: "маникюр" (запись создана) → "хочу еще и окрашивание" = НОВАЯ запись на окрашивание
+
+🚨 КЛЮЧЕВЫЕ СЛОВА "ЕЩЕ" И "ТЕПЕРЬ":
+- "теперь хочу записаться еще и на окрашивание" = НОВАЯ отдельная запись (НЕ комбо!)
+- "еще хочу", "теперь хочу", "дополнительно хочу" = отдельная услуга
+- Слова "еще", "теперь", "дополнительно" указывают на ПОСЛЕДОВАТЕЛЬНОСТЬ, а не комбо
+- В таких случаях НЕ используй ask_combo_services - используй search_services
+
 🚨 КРИТИЧНО ДЛЯ КОМБО-ДАТ:
 - Если есть combo_service1 И combo_service2 И пользователь говорит "в один день" → ОБЯЗАТЕЛЬНО show_dates
 - Если есть combo_service1 И combo_service2 И пользователь говорит "вместе" → ОБЯЗАТЕЛЬНО show_dates
@@ -1389,9 +1646,10 @@ EXTRACT_TIME: [конкретное время, если упомянуто, н�
 - combo_service1 + combo_service2 + дата = show_combo_time_slots (НЕ show_time_slots!)
 
 🚨 КРИТИЧНО ДЛЯ КОМБО-ВРЕМЕНИ:
-- Если в контексте есть combo_service1 И combo_service2 И выбрана дата → show_combo_time_slots
-- Если в контексте есть combo_service1 И combo_service2 И конкретное время → select_time_combo
+- Если в контексте есть combo_service1 И combo_service2 И пользователь назвал дату → НЕМЕДЛЕННО show_combo_time_slots
+- После show_combo_time_slots, если пользователь выбрал группу/время → select_time_combo
 - НЕ show_time_slots для комбо! НЕ complete_booking для комбо!
+- КРИТИЧНО: Сразу после выбора даты показывай все группы времени (пересекающиеся + отдельные)!
 
 🚨 КРИТИЧНО ПРИ ВЫБОРЕ "ЛЮБОЕ":
 - "любое", "все равно", "не важно" = show_time_slots
@@ -1399,17 +1657,17 @@ EXTRACT_TIME: [конкретное время, если упомянуто, н�
 
 🚨 ЗАПРЕТ ПРОПУСКА ЭТАПОВ:
 - НИКОГДА не переходи к select_time_combo БЕЗ выбора даты и времени!
-- ask_combo_dates → show_dates → show_time_slots → select_time_combo
+- ask_combo_dates → show_dates → show_combo_time_slots → select_time_combo
 - НЕ пропускай этапы даже если услуги уже выбраны!
 
 🚨 ПРИОРИТЕТ ВЫБОРА ВРЕМЕНИ:
 - "утро", "день", "вечер" (БЕЗ конкретного времени) → clarify_time_period
 - "любое", "все равно", "не важно", "любое время" → show_time_slots (ВСЕ слоты!)
-- "17:00", "10:30" (конкретное время для одной услуги) → select_time
-- "16:00", "17:00" (конкретное время для КОМБО-УСЛУГ) → select_time_combo (с графиком!)
+- "17:00", "10:30" (конкретное время для одной услуги) → clarify_time_period
+- "16:00", "17:00" (конкретное время для КОМБО-УСЛУГ) → show_combo_time_slots (показать группы!)
 - НЕ путай периоды времени с конкретным временем!
 - КРИТИЧНО: "любое" = показать ВСЕ доступные слоты, НЕ complete_booking!
-- КРИТИЧНО: Если в контексте есть ДВЕ услуги → ВСЕГДА select_time_combo!
+- КРИТИЧНО: Если в контексте есть ДВЕ услуги → ВСЕГДА show_combo_time_slots!
 
 ДЕЙСТВИЯ:
 - start_dialog: начать диалог
@@ -1472,9 +1730,9 @@ EXTRACT_TIME: [конкретное время, если упомянуто, н�
 4. После выбора ОБЕИХ услуг перейти к ask_combo_dates
 5. Предложить записать в один день или разные дни
 6. КРИТИЧНО: Если пользователь выбрал "в один день", "одну дату", "вместе" → НЕМЕДЛЕННО show_dates
-7. После выбора даты показать слоты времени → show_combo_time_slots
-8. После выбора времени создать расписание → select_time_combo (с графиком процедур)
-9. КРИТИЧНО: НЕ пропускай этапы выбора даты и времени!
+7. КРИТИЧНО: После выбора даты ("27 августа") → НЕМЕДЛЕННО show_combo_time_slots
+8. После выбора группы времени → select_time_combo (с графиком процедур)
+9. КРИТИЧНО: НЕ пропускай показ комбо-слотов после выбора даты!
 
 🚨 ТРИГГЕРЫ ДЛЯ SHOW_DATES В КОМБО:
 - "в один день" → show_dates
@@ -1483,6 +1741,11 @@ EXTRACT_TIME: [конкретное время, если упомянуто, н�
 - "совместно" → show_dates
 - "за раз" → show_dates
 - "сразу обе" → show_dates
+
+🚨 ТРИГГЕРЫ ДЛЯ SHOW_COMBO_TIME_SLOTS:
+- Если есть combo_service1 + combo_service2 + пользователь назвал ЛЮБУЮ дату → show_combo_time_slots
+- "27 августа", "завтра", "в понедельник" в контексте комбо → show_combo_time_slots
+- НЕ спрашивай "какое время удобно" для комбо - сразу показывай все группы!
 
 🚨 КОМБО + ДАТА: 
 - Если комбо содержит дату ("маникюр и окрашивание на завтра") - запомни дату, но сначала уточни услуги
@@ -1511,9 +1774,18 @@ EXTRACT_TIME: [конкретное время, если упомянуто, н�
 - Используй booking_dates из данных мастеров для формирования списка доступных дат
 
 🚨 ВАЖНО ДЛЯ ВЫБОРА ВРЕМЕНИ:
-- Если пользователь называет время ("15:00", "3 часа дня", "утром в 10") - это clarify_time_period
+- Если пользователь называет время ("15:00", "19:00", "11 30") - это ВСЕГДА clarify_time_period
 - В extracted_info сохраняй выбранное время в поле 'selected_time'
-- Слова-триггеры времени: "10:00", "15:30", "в 2", "утром", "днем", "вечером"
+- Слова-триггеры времени: "10:00", "15:30", "19:00", "11 30", "в 2", "утром", "днем", "вечером"
+- КРИТИЧНО: "19:00" или "19 00" = clarify_time_period (показать мастеров), НЕ финальная запись!
+- ЗАПРЕЩЕНО: сразу создавать запись без выбора мастера
+
+🚨 КРИТИЧНО ДЛЯ ВЫБОРА МАСТЕРА:
+- Если пользователь называет имя мастера ("Воронова Янина", "Сакович Елена") - это ВСЕГДА book_appointment
+- В extracted_info ОБЯЗАТЕЛЬНО сохраняй выбранного мастера в поле 'master_name' или 'selected_master'
+- Примеры: "Воронова Янина" → extracted_info: {'master_name': 'Воронова Янина'}
+- КРИТИЧНО: ТОЧНО используй то имя, которое назвал пользователь, НЕ подставляй другого мастера
+- ЗАПРЕЩЕНО: путать имена мастеров или использовать неправильного мастера в записи
 
 🚨 КРИТИЧНЫЕ ПРАВИЛА АНАЛИЗА СООБЩЕНИЙ:
 - Если пользователь упоминает конкретную услугу + дату + время - анализируй как ПОЛНЫЙ запрос на запись
@@ -1526,9 +1798,11 @@ EXTRACT_TIME: [конкретное время, если упомянуто, н�
 - Если пользователь подтвердил услугу ("да", "только покрытие", "этот вариант") - переходи к ask_date
 - После ask_date, если пользователь называет конкретную дату → show_time_slots (покажи уникальные времена)
 - После ask_date, если пользователь спрашивает "какие есть даты" → show_dates  
-- После show_time_slots, если выбрал конкретное время (например "15:00") → clarify_time_period (покажи мастеров)
-- После clarify_time_period, если выбрал мастера → book_appointment (начать подтверждение записи)
+- После show_time_slots, если выбрал конкретное время (например "15:00", "19:00") → ОБЯЗАТЕЛЬНО clarify_time_period (покажи мастеров)
+- После clarify_time_period, если выбрал мастера → ОБЯЗАТЕЛЬНО book_appointment (начать подтверждение записи)
 - НЕ показывай даты сразу после выбора услуги - сначала спроси какая дата нужна
+- КРИТИЧНО: НИКОГДА не создавай финальную запись без этапов clarify_time_period → book_appointment
+- ЗАПРЕЩЕНО: пропускать выбор мастера и процесс подтверждения
 
 🚨 ОБРАБОТКА ПОЛНЫХ ЗАПРОСОВ (УМНАЯ):
 - Услуга + дата + время в одном сообщении = show_time_slots (показать конкретные слоты)
@@ -1541,6 +1815,12 @@ EXTRACT_TIME: [конкретное время, если упомянуто, н�
 - Если услуга не конкретная - сначала покажи варианты услуг, потом используй дату
 - ОБЯЗАТЕЛЬНО дублируй дату в скобках с конкретным числом и месяцем
 - Формат: "[Имя], отлично! Записываю вас на [КОНКРЕТНАЯ услуга] на [что сказал пользователь] ([конкретное число и месяц]). Какое время вам удобно - утро, день или вечер?"
+
+🚨 КРИТИЧНО ДЛЯ КОНКРЕТНЫХ ДАТ:
+- "26 августа", "27 августа", "28 августа" и любые другие конкретные даты = ВСЕГДА show_time_slots
+- НЕ check_booking или ask_date для конкретных дат!
+- Если в контексте есть selected_service И пользователь называет конкретную дату = show_time_slots
+- ЗАПРЕЩЕНО: использовать check_booking для дат типа "26 августа"
 
 Анализируй контекст и текущий этап, чтобы определить правильное следующее действие."""
 
@@ -1686,14 +1966,11 @@ SHOW_AVAILABLE_DATES / SHOW_DATES:
 SHOW_TIME_SLOTS:
 "[Имя], отлично! Для записи на [услуга] на [дата] доступны такие варианты:
 
-🌅 **Утро (9:00-12:00):**
-[УНИКАЛЬНЫЕ ВРЕМЕНА БЕЗ ПОВТОРОВ: 10:00, 10:30, 11:00, 11:30, 12:00]
+🚨 КРИТИЧНО: ИСПОЛЬЗУЙ ТОЛЬКО РЕАЛЬНЫЕ СЛОТЫ ИЗ "СЛОТЫ ВРЕМЕНИ"!
+🚨 НЕ ГЕНЕРИРУЙ фиктивные времена типа "10:00, 11:00"!
+🚨 ЕСЛИ "СЛОТЫ ВРЕМЕНИ" пустые - скажи что слотов нет!
 
-☀️ **День (12:00-17:00):** 
-[УНИКАЛЬНЫЕ ВРЕМЕНА БЕЗ ПОВТОРОВ: 12:30, 13:00, 13:30, 14:00, 14:30, 15:00, 15:30, 16:00, 16:30, 17:00]
-
-🌙 **Вечер (17:00-20:00):**
-[УНИКАЛЬНЫЕ ВРЕМЕНА БЕЗ ПОВТОРОВ: 17:30, 18:00, 18:30, 19:00]
+[ПОКАЖИ РЕАЛЬНЫЕ СЛОТЫ ИЗ ПЕРЕДАННЫХ ДАННЫХ time_slots С ГРУППИРОВКОЙ ПО ПЕРИОДАМ]
 
 Назовите удобное время, и я покажу каких мастеров можно выбрать ✨"
 
@@ -1736,7 +2013,7 @@ SELECT_TIME:
 Ожидаем вас! Если нужно будет перенести запись, сообщите заранее 😊"
 
 SELECT_TIME_COMBO:
-"[Имя], отлично! Записываю вас на [дата] в [время]:
+"[Имя], отлично! Подтверждаю детали записи на [дата] в [время]:
 
 🕐 **График процедур:**
 • [время начала] - [время окончания первой услуги]: [первая услуга] ([мастер 1])
@@ -1746,7 +2023,10 @@ SELECT_TIME_COMBO:
 💰 Общая стоимость: [стоимость первой] + [стоимость второй] = [общая сумма] руб.
 ⏱️ Общее время: [продолжительность] (с [время начала] до [время окончания всех процедур])
 
-План готов! Ожидаем вас на полное преображение ✨"
+Подтверждаете запись?
+
+Напишите 'ДА' - если хотите записаться
+Напишите 'НЕТ' - если передумали"
 
 COMPLETE_BOOKING:
 "[Имя], отлично! Записываю вас на [услуга] на [выбранная дата пользователем] ([конкретная дата с числом и месяцем]). Какое время вам удобно — утро, день или вечер? ✨"
@@ -1885,16 +2165,30 @@ COMPLETE_BOOKING:
 - СТРОГО используй ТОЛЬКО шаблон SELECT_TIME_COMBO (НЕ обычные шаблоны!)
 - ПРИЗНАКИ КОМБО В КОНТЕКСТЕ: combo_service1, combo_service2, is_combo=true
 - ЕСЛИ в памяти есть ДВЕ услуги (combo_service1 И combo_service2) → select_time_combo
-- ОБЯЗАТЕЛЬНО заполни ВСЕ поля шаблона:
-  * [время начала] = выбранное пользователем время (например: 16:00)
-  * [время окончания первой услуги] = время начала + 1 час (например: 17:00) 
-  * [время начала второй] = время окончания первой (например: 17:00)
-  * [время окончания] = время начала второй + длительность (например: 19:00)
-  * [мастер 1] и [мастер 2] = ОБЯЗАТЕЛЬНО используй master1_name и master2_name из time_slots!
-  * [общая сумма] = сумма цен обеих услуг
-- КРИТИЧНО: Используй реальные имена мастеров из переданных данных time_slots
+- ОБЯЗАТЕЛЬНО заполни ВСЕ поля шаблона из СЛОТЫ ВРЕМЕНИ:
+  * [Имя] = из КОНТЕКСТА user_name  
+  * [дата] = из СЛОТЫ ВРЕМЕНИ selected_date
+  * [время] = из СЛОТЫ ВРЕМЕНИ service1_time
+  * [время начала] = из СЛОТЫ ВРЕМЕНИ service1_time
+  * [время окончания первой услуги] = из СЛОТЫ ВРЕМЕНИ service2_time
+  * [первая услуга] = из СЛОТЫ ВРЕМЕНИ service1_title
+  * [мастер 1] = из СЛОТЫ ВРЕМЕНИ master1_name
+  * [время начала второй] = из СЛОТЫ ВРЕМЕНИ service2_time  
+  * [время окончания] = service2_time + 1 час
+  * [вторая услуга] = из СЛОТЫ ВРЕМЕНИ service2_title
+  * [мастер 2] = из СЛОТЫ ВРЕМЕНИ master2_name
+  * [стоимость первой] = из СЛОТЫ ВРЕМЕНИ service1_price
+  * [стоимость второй] = из СЛОТЫ ВРЕМЕНИ service2_price
+  * [общая сумма] = из СЛОТЫ ВРЕМЕНИ total_price
+- КРИТИЧНО: Используй ТОЛЬКО данные из СЛОТЫ ВРЕМЕНИ, НЕ выдумывай!
 - Пример: 16:00 → "16:00-17:00: маникюр (Анна), 17:00-19:00: мелирование (Елена)"
 - КРИТИЧНО: НЕ используй complete_booking для комбо-услуг!
+
+🚨 КРИТИЧНО ДЛЯ SHOW_TIME_SLOTS:
+- ЕСЛИ в "СЛОТЫ ВРЕМЕНИ" пустой список [] или написано "Не требуются" - НЕ генерируй фиктивные времена!
+- В таком случае скажи: "[Имя], к сожалению, на [дата] нет свободных слотов для [услуга]. Попробуем другую дату?"
+- ТОЛЬКО если есть реальные слоты - показывай их с группировкой
+- НИКОГДА не пиши "10:00, 11:00, 14:00" если этих времен нет в реальных данных!
 
 Генерируй ответ строго по указанному действию и этапу, используя контекст и данные об услугах."""
 

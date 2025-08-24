@@ -80,3 +80,4 @@ def test_evgeny_scenario():
 if __name__ == "__main__":
     print("🔍 Воспроизведение проблемы Евгения\n")
     test_evgeny_scenario()
+

@@ -20,3 +20,4 @@ echo "🚀 Запускаем бота..."
 python restart_telegram_bot.py
 
 echo "✅ Готово!"
+

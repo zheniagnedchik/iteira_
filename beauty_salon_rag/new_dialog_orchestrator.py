@@ -58,6 +58,17 @@ class NewDialogOrchestrator:
                 context=context
             )
             
+            # Проверяем, нужно ли запустить процесс подтверждения после select_time_combo
+            if result['context'].get('needs_booking_confirmation'):
+                self.logger.info("Запускаем процесс подтверждения записи после select_time_combo")
+                result['context'].pop('needs_booking_confirmation', None)  # Убираем флаг
+                
+                # Подготавливаем детали записи для подтверждения
+                booking_details = self._prepare_combo_booking_details(result['context'])
+                response_text, updated_context = self.dialog_assistant.booking_confirmation.start_booking_confirmation(booking_details)
+                result['context'].update(updated_context)
+                result['response'] = response_text
+            
             # Обновляем контекст пользователя
             self.user_contexts[user_id] = result['context']
             
@@ -74,6 +85,48 @@ class NewDialogOrchestrator:
             self.logger.error(f"Ошибка в NewDialogOrchestrator: {e}")
             # Для ошибок возвращаем простой fallback
             return "Извините, произошла техническая ошибка. Попробуйте позже или обратитесь к администратору."
+
+    def _prepare_combo_booking_details(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Подготавливает детали комбо-записи для подтверждения"""
+        try:
+            combo_service1 = context.get('combo_service1', {})
+            combo_service2 = context.get('combo_service2', {})
+            
+            # Базовые детали
+            booking_details = {
+                'service_title': f"{combo_service1.get('title', '')} + {combo_service2.get('title', '')}",
+                'date': context.get('selected_date'),
+                'time': context.get('selected_time'),
+                'location': 'ул. Немига, 5',
+                'is_combo': True,
+                'combo_service1': combo_service1,
+                'combo_service2': combo_service2,
+                'price': (combo_service1.get('price', 0) + combo_service2.get('price', 0))
+            }
+            
+            # Добавляем информацию о мастерах из last_time_slots
+            last_time_slots = context.get('last_time_slots', [])
+            if last_time_slots and len(last_time_slots) > 0:
+                slot = last_time_slots[0]
+                booking_details['master1_name'] = slot.get('master1_name', 'уточняется')
+                booking_details['master2_name'] = slot.get('master2_name', 'уточняется')
+                booking_details['service1_time'] = slot.get('service1_time', context.get('selected_time'))
+                booking_details['service2_time'] = slot.get('service2_time', context.get('selected_time'))
+            
+            self.logger.info(f"Подготовлены детали комбо-записи: {booking_details}")
+            return booking_details
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка при подготовке деталей комбо-записи: {e}")
+            # Возвращаем базовые данные
+            return {
+                'service_title': 'Комбо-услуги',
+                'date': context.get('selected_date'),
+                'time': context.get('selected_time'),
+                'location': 'ул. Немига, 5',
+                'is_combo': True,
+                'price': 0
+            }
 
     def get_user_context(self, user_id: str) -> Dict[str, Any]:
         """
